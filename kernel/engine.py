@@ -226,7 +226,7 @@ class AIDOSKernel:
         self.vfs.mount("/system/plugins", reader=lambda: ", ".join(sorted(TOOLS.keys())) or "(none)")
 
         # Multi-agent system
-        self.orchestrator = AgentOrchestrator()
+        self.orchestrator = AgentOrchestrator(bus=self.bus)
         self.orchestrator.register(Agent("coder", CODER_PROMPT))
         self.orchestrator.register(Agent("research", RESEARCHER_PROMPT))
         self.orchestrator.register(Agent("sysadmin", SYSADMIN_PROMPT))

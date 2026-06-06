@@ -50,19 +50,29 @@ Given a complex request, break it into steps and recommend which agent(s) should
 
 class Agent:
     """
-    An AI agent with its own LLM provider, system prompt, and conversation context.
+    An AI agent with its own LLM provider, system prompt, conversation context,
+    and optional EventBus integration for inter-agent communication.
     """
 
-    def __init__(self, name: str, system_prompt: str, model: str = None):
+    def __init__(self, name: str, system_prompt: str, model: str = None, bus=None):
         self.name = name
         self.system_prompt = system_prompt
         self.llm = get_provider(model=model or "llama3.2:1b")
         self.messages: List[Dict] = [{"role": "system", "content": system_prompt}]
         self.session_log: List[Dict] = []
+        self.bus = bus
 
     def process(self, user_input: str) -> dict:
-        """Process an input through this agent's LLM. Returns parsed JSON decision."""
+        """Process an input through this agent's LLM. Returns parsed JSON decision.
+
+        If connected to an EventBus, emits ``agent.<name>.started`` before
+        processing and ``agent.<name>.output`` with the result afterwards.
+        """
         self.messages.append({"role": "user", "content": user_input})
+
+        if self.bus:
+            self.bus.emit(f"agent.{self.name}.started", {"task": user_input})
+
         raw = self.llm.query(self.system_prompt, user_input, self.messages[1:])
         decision = extract_json(raw)
         if decision is None:
@@ -73,6 +83,14 @@ class Agent:
             }
         self.messages.append({"role": "assistant", "content": json.dumps(decision)})
         self.session_log.append({"input": user_input, "output": decision})
+
+        if self.bus:
+            self.bus.emit(f"agent.{self.name}.output", {
+                "task": user_input,
+                "response": decision.get("user_response", ""),
+                "has_commands": bool(decision.get("commands")),
+            })
+
         return decision
 
     def reset(self):
@@ -85,11 +103,13 @@ class AgentOrchestrator:
     Orchestrates multiple agents — delegates tasks, collects results, merges responses.
     """
 
-    def __init__(self):
+    def __init__(self, bus=None):
         self.agents: Dict[str, Agent] = {}
+        self.bus = bus
 
     def register(self, agent: Agent):
-        """Register an agent by name."""
+        """Register an agent by name and connect it to the bus."""
+        agent.bus = self.bus
         self.agents[agent.name] = agent
 
     def get(self, name: str) -> Optional[Agent]:
