@@ -24,6 +24,7 @@ from kernel.service import Service
 from kernel.scheduler import BackgroundTaskScheduler, TaskStatus
 from kernel.vfs import VirtualFileSystem
 from kernel.agent import Agent, AgentOrchestrator, CODER_PROMPT, RESEARCHER_PROMPT, SYSADMIN_PROMPT, PLANNER_PROMPT
+from kernel.checkpoint import save_checkpoint, load_checkpoint
 
 # Rich UI components
 from rich.console import Console
@@ -232,7 +233,7 @@ class AIDOSKernel:
         self.orchestrator.register(Agent("planner", PLANNER_PROMPT))
         self.vfs.mount("/system/agents", reader=lambda: ", ".join(self.orchestrator.list_agents()))
 
-        # Restore previous session
+        load_checkpoint(self)
         saved = load_session()
         if saved:
             console.print(f"  [dim][restored {len(saved)} messages from last session][/dim]")
@@ -657,6 +658,7 @@ class AIDOSKernel:
 
     def _show_shutdown(self):
         """Display shutdown message."""
+        save_checkpoint(self)
         self.scheduler.stop()
         save_session(self.messages)
         tasks_count = len(self.scheduler.list_tasks())
