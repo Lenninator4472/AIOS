@@ -16,8 +16,14 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from kernel.llm import get_provider, extract_json
-from kernel.executor import execute, needs_confirmation
+from kernel.executor import execute, needs_confirmation, set_dry_run, is_dry_run
 from kernel.memory import ConversationMemory
+from kernel.memory_store import FactMemory
+from kernel.bus import EventBus
+from kernel.service import Service
+from kernel.scheduler import BackgroundTaskScheduler, TaskStatus
+from kernel.vfs import VirtualFileSystem
+from kernel.agent import Agent, AgentOrchestrator, CODER_PROMPT, RESEARCHER_PROMPT, SYSADMIN_PROMPT, PLANNER_PROMPT
 
 # Rich UI components
 from rich.console import Console
@@ -41,9 +47,28 @@ MAX_TOOL_DEPTH = 10
 # Built-in tool definitions the LLM can invoke directly
 TOOLS = {}
 
-TOOL_DOC = """
-PLUGIN TOOLS (use instead of commands for these operations):
-"""
+
+def build_tool_definitions() -> str:
+    """Build a TOOL_DEFINITIONS string from registered plugin tools."""
+    if not TOOLS:
+        return ""
+    lines = ["\n\nAVAILABLE PLUGIN TOOLS:"]
+    for name, func in sorted(TOOLS.items()):
+        doc = (func.__doc__ or "No description").strip()
+        sig = inspect.signature(func)
+        params = []
+        for p_name, p_param in sig.parameters.items():
+            if p_param.default is not inspect.Parameter.empty:
+                params.append(f"{p_name}={p_param.default}")
+            else:
+                params.append(p_name)
+        sig_str = f"tool_{name}({', '.join(params)})"
+        lines.append(f"  {sig_str}")
+        lines.append(f"    {doc}")
+    lines.append('')
+    lines.append('To call a tool, include a "tool_calls" field in your JSON:')
+    lines.append('[{"name": "tool_name", "arguments": {"arg1": "value1"}}]')
+    return "\n".join(lines)
 
 SYSTEM_PROMPT = """You are the Core Intelligence Kernel of an experimental operating system named AI-DOS. You sit directly between the user's natural language desires and a low-level Linux backbone. Your job is to translate human intent into flawless, safe, and efficient system-level actions.
 
@@ -55,6 +80,7 @@ You must respond with ONLY a valid JSON object. No markdown wrapping, no code fe
 {
   "thought_process": "Briefly state what the user wants and your plan of execution.",
   "required_tools": ["terminal", "network", "filesystem"],
+  "tool_calls": [],  // optional: list of plugin tools to invoke
   "commands": ["command_1", "command_2"],
   "user_response": "A clean, natural language update explaining what you are doing or displaying the final result."
 }
@@ -63,6 +89,7 @@ CRITICAL RULES:
 - SELF-CORRECTION: If a command fails, analyze the error and generate a corrective command.
 - DESTRUCTIVE COMMANDS: If the user asks to delete critical system files, pause execution and ask for manual user confirmation in the "user_response" block.
 - EFFICIENCY: Combine commands whenever possible to reduce system overhead.
+- PLUGIN TOOLS: Use the tool_calls field to invoke plugin tools instead of shell commands when available.
 - If the user request is just a question, leave the "commands" list empty.
 - Output ONLY valid JSON. No other text. I repeat: ONLY valid JSON."""
 
@@ -164,13 +191,46 @@ def parse_tool_call(text):
 class AIDOSKernel:
     """The AI-DOS kernel orchestrator."""
 
-    def __init__(self, model: str = "llama3.2:1b"):
+    def __init__(self, model: str = "llama3.2:1b", dry_run: bool = False):
         self.llm = get_provider(model=model)
         self.memory = ConversationMemory(max_exchanges=10)
         self.memory.initialize_default_account()
         self.max_correction_retries = 3
         self.session_log: list[dict] = []
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        load_plugins()
+        tool_defs = build_tool_definitions()
+        self.system_prompt = SYSTEM_PROMPT + tool_defs
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+        set_dry_run(dry_run)
+        self.dry_run = dry_run
+        self.facts = FactMemory()
+        self.bus = EventBus()
+        self.scheduler = BackgroundTaskScheduler(self.bus)
+        self.scheduler.start()
+        self._task_log: list[dict] = []
+        self.bus.subscribe("task.completed", self._on_task_event)
+        self.bus.subscribe("task.failed", self._on_task_event)
+        self.bus.subscribe("task.started", self._on_task_event)
+
+        # Virtual filesystem: mount live kernel data
+        self.vfs = VirtualFileSystem()
+        self.vfs.mount("/memory", reader=lambda: self._format_vfs_memory())
+        self.vfs.mount("/profile", reader=lambda: self._format_vfs_profile())
+        self.vfs.mount("/tasks", reader=lambda: self._format_vfs_tasks())
+        self.vfs.mount("/system/provider", reader=lambda: type(self.llm).__name__)
+        self.vfs.mount("/system/model", reader=lambda: getattr(self.llm, "model", "unknown"))
+        self.vfs.mount("/system/dry_run", reader=lambda: str(self.dry_run))
+        self.vfs.mount("/system/facts_count", reader=lambda: str(self.facts.count()))
+        self.vfs.mount("/system/plugins", reader=lambda: ", ".join(sorted(TOOLS.keys())) or "(none)")
+
+        # Multi-agent system
+        self.orchestrator = AgentOrchestrator()
+        self.orchestrator.register(Agent("coder", CODER_PROMPT))
+        self.orchestrator.register(Agent("research", RESEARCHER_PROMPT))
+        self.orchestrator.register(Agent("sysadmin", SYSADMIN_PROMPT))
+        self.orchestrator.register(Agent("planner", PLANNER_PROMPT))
+        self.vfs.mount("/system/agents", reader=lambda: ", ".join(self.orchestrator.list_agents()))
 
         # Restore previous session
         saved = load_session()
@@ -178,33 +238,53 @@ class AIDOSKernel:
             console.print(f"  [dim][restored {len(saved)} messages from last session][/dim]")
             self.messages.extend(saved)
 
+    def _format_vfs_memory(self) -> str:
+        facts = self.facts.list_all(limit=5)
+        if not facts:
+            return "No facts stored."
+        lines = [f"#{f['id']}: {f['text']}" for f in facts]
+        return "\n".join(lines)
+
+    def _format_vfs_profile(self) -> str:
+        p = self.memory.get_profile()
+        return "\n".join(f"{k}: {v}" for k, v in p.items())
+
+    def _format_vfs_tasks(self) -> str:
+        tasks = self.scheduler.list_tasks()
+        if not tasks:
+            return "No background tasks."
+        lines = []
+        for t in tasks:
+            lines.append(f"[{t.status.value}] {t.task_id[:8]} {t.command[:50]}")
+        return "\n".join(lines)
+
+    def _on_task_event(self, event_type: str, data: dict):
+        """Callback for task lifecycle events from the scheduler."""
+        self._task_log.append({"event": event_type, "data": data})
+        if event_type == "task.completed":
+            tid = data.get("task_id", "?")[:8]
+            console.print(f"\n  [green]✔ Task {tid} completed[/green]")
+        elif event_type == "task.failed":
+            tid = data.get("task_id", "?")[:8]
+            console.print(f"\n  [red]✗ Task {tid} failed (exit {data.get('exit_code')})[/red]")
+
     def process_intent(self, user_input: str) -> dict:
         """Process a user command through the LLM and return structured decision."""
-        # Fetch persistent account details
         profile = self.memory.get_profile()
         profile_context = f"\n\nCURRENT LOGGED ACCOUNT:\n- User: {profile.get('real_name')} ({profile.get('username')})\n- Access Role: {profile.get('system_role')}\n- Primary Environment: {profile.get('primary_stack')}"
+        active_system_prompt = self.system_prompt + profile_context
 
-        # Inject details dynamically into the root system rules
-        active_system_prompt = SYSTEM_PROMPT + profile_context
-
-        # Build prompt with conversation context
         full_prompt = self._build_prompt(user_input)
 
-        # Track conversation for context pruning
         self.messages.append({"role": "user", "content": user_input})
         self.memory.add("user", user_input)
 
-        # Prune context before LLM call
         prune_context(self.messages)
 
-        # Query the LLM using the newly updated prompt template
         raw_response = self.llm.query(active_system_prompt, full_prompt, self.memory.get_context())
-
-        # Extract JSON
         decision = extract_json(raw_response)
 
         if decision is None:
-            # LLM didn't return valid JSON; wrap in error
             console.print(f"[dim]Raw LLM response: {raw_response[:200]}...[/dim]")
             return {
                 "thought_process": "Failed to parse LLM response as JSON",
@@ -212,6 +292,68 @@ class AIDOSKernel:
                 "commands": [],
                 "user_response": f"⚠ Kernel parse error: LLM returned malformed JSON. Raw: {raw_response[:150]}",
             }
+
+        return decision
+
+    def process_intent_streaming(self, user_input: str) -> dict:
+        """Process intent with live token streaming to console.
+
+        Streams the raw LLM response tokens as they arrive, then parses JSON
+        and handles tool calls embedded in the response.
+        """
+        profile = self.memory.get_profile()
+        profile_context = f"\n\nCURRENT LOGGED ACCOUNT:\n- User: {profile.get('real_name')} ({profile.get('username')})\n- Access Role: {profile.get('system_role')}\n- Primary Environment: {profile.get('primary_stack')}"
+        active_system_prompt = self.system_prompt + profile_context
+
+        full_prompt = self._build_prompt(user_input)
+
+        self.messages.append({"role": "user", "content": user_input})
+        self.memory.add("user", user_input)
+
+        prune_context(self.messages)
+
+        console.print("[bold cyan]🧠[/bold cyan] ", end="")
+        stream = self.llm.query_stream(active_system_prompt, full_prompt, self.memory.get_context())
+
+        raw_response = ""
+        for token in stream:
+            raw_response += token
+            console.print(token, end="", flush=True)
+        console.print()
+
+        # Check for TOOL: calls embedded in the raw response
+        tool_call = parse_tool_call(raw_response)
+        if tool_call and tool_call["name"] in TOOLS:
+            func = TOOLS[tool_call["name"]]
+            try:
+                result = func(**tool_call["arguments"])
+                console.print(f"  [dim]🔧 tool {tool_call['name']} → {result[:200]}[/dim]")
+            except Exception as e:
+                console.print(f"  [dim][red]🔧 tool {tool_call['name']} error: {e}[/red][/dim]")
+
+        decision = extract_json(raw_response)
+
+        if decision is None:
+            console.print(f"[dim]Raw LLM response: {raw_response[:200]}...[/dim]")
+            return {
+                "thought_process": "Failed to parse LLM response as JSON",
+                "required_tools": [],
+                "commands": [],
+                "user_response": f"⚠ Kernel parse error. Raw: {raw_response[:150]}",
+            }
+
+        # Handle tool_calls from JSON decision
+        tool_calls = decision.get("tool_calls", [])
+        for tc in tool_calls:
+            name = tc.get("name", "")
+            args = tc.get("arguments", {})
+            if name in TOOLS:
+                func = TOOLS[name]
+                try:
+                    result = func(**args)
+                    console.print(f"  [dim]🔧 {name} → {str(result)[:200]}[/dim]")
+                except Exception as e:
+                    console.print(f"  [dim][red]🔧 {name} error: {e}[/red][/dim]")
 
         return decision
 
@@ -275,7 +417,7 @@ class AIDOSKernel:
 
                 console.print(f"[yellow]⚠ Command failed (exit {result['exit_code']}). Attempting auto-correction... (try {retries + 1}/{self.max_correction_retries})[/yellow]")
 
-                fix_response = self.llm.query(SYSTEM_PROMPT, error_context, self.memory.get_context())
+                fix_response = self.llm.query(self.system_prompt, error_context, self.memory.get_context())
                 fix_decision = extract_json(fix_response)
 
                 if fix_decision and "commands" in fix_decision and fix_decision["commands"]:
@@ -328,10 +470,98 @@ class AIDOSKernel:
                             self.llm.model = new_model
                             console.print(f"[green]Switched to model: {new_model}[/green]")
                         continue
+                    if user_input.lower() in ("dry-run", "dryrun"):
+                        self.dry_run = not self.dry_run
+                        set_dry_run(self.dry_run)
+                        status = "ON" if self.dry_run else "OFF"
+                        console.print(f"[yellow]Dry-run mode: {status}[/yellow]")
+                        continue
+                    if user_input.lower().startswith("bg "):
+                        cmd = user_input[3:].strip()
+                        if cmd:
+                            tid = self.scheduler.schedule(cmd)
+                            console.print(f"[green]→ Background task launched: {tid[:8]}[/green]")
+                        continue
+                    if user_input.lower() in ("jobs", "tasks"):
+                        tasks = self.scheduler.list_tasks()
+                        if tasks:
+                            for t in tasks:
+                                status_icon = {"pending": "⏳", "running": "▶", "completed": "✔", "failed": "✗"}
+                                icon = status_icon.get(t.status.value, "?")
+                                console.print(f"  {icon} [dim]{t.task_id[:8]}[/dim] {t.command[:50]} [dim]({t.status.value})[/dim]")
+                        else:
+                            console.print("[dim]No background tasks.[/dim]")
+                        continue
+                    if user_input.lower().startswith("cancel "):
+                        tid = user_input[7:].strip()
+                        if tid:
+                            ok = self.scheduler.cancel(tid)
+                            console.print(f"[green]Task cancelled[/green]" if ok else "[yellow]Task not found or not running[/yellow]")
+                        continue
+                    if user_input.lower().startswith("remember "):
+                        text = user_input[9:].strip()
+                        if text:
+                            fid = self.facts.remember(text)
+                            console.print(f"[green]Remembered! (fact #{fid})[/green]")
+                        continue
+                    if user_input.lower().startswith("recall "):
+                        query = user_input[7:].strip()
+                        if query:
+                            results = self.facts.recall(query)
+                            if results:
+                                for r in results:
+                                    console.print(f"  [dim]#{r['id']}[/dim] {r['text']} [dim](score: {r['score']})[/dim]")
+                            else:
+                                console.print("[yellow]No matching memories found.[/yellow]")
+                        continue
+                    if user_input.lower().startswith("cat "):
+                        vpath = user_input[4:].strip()
+                        if vpath:
+                            try:
+                                content = self.vfs.read(vpath)
+                                console.print(content)
+                            except Exception as e:
+                                console.print(f"[red]VFS error: {e}[/red]")
+                        continue
+                    if user_input.lower().startswith("agent "):
+                        parts = user_input[6:].strip().split(" ", 1)
+                        if len(parts) == 2:
+                            agent_name, task = parts
+                            agent = self.orchestrator.get(agent_name)
+                            if agent:
+                                console.print(f"[dim]{agent_name} thinking...[/dim]")
+                                result = agent.process(task)
+                                resp = result.get("user_response", json.dumps(result))[:500]
+                                console.print(Panel(resp, title=f"🤖 {agent_name}", border_style="blue"))
+                            else:
+                                console.print(f"[red]Unknown agent: {agent_name}. Available: {', '.join(self.orchestrator.list_agents())}[/red]")
+                        else:
+                            console.print("[yellow]Usage: agent <name> <task>[/yellow]")
+                        continue
+                    if user_input.lower() in ("agents",):
+                        agents = self.orchestrator.list_agents()
+                        console.print("[bold]Available agents:[/bold]")
+                        for a in agents:
+                            console.print(f"  🤖 {a}")
+                        continue
+                    if user_input.lower() == "vfs":
+                        items = self.vfs.listdir("/")
+                        console.print("[bold]Virtual Filesystem:[/bold]")
+                        for name, is_dir in items:
+                            marker = "/" if is_dir else ""
+                            console.print(f"  /{name}{marker}")
+                        continue
+                    if user_input.lower() in ("facts", "memories"):
+                        facts = self.facts.list_all()
+                        if facts:
+                            for f in facts:
+                                console.print(f"  [dim]#{f['id']}[/dim] {f['text']}")
+                        else:
+                            console.print("[dim]No facts stored yet.[/dim]")
+                        continue
 
-                    # --- PROCESS INTENT ---
-                    with console.status("[bold cyan]🧠 Processing intent...[/bold cyan]"):
-                        decision = self.process_intent(user_input)
+                    # --- PROCESS INTENT (streaming) ---
+                    decision = self.process_intent_streaming(user_input)
 
                     # Store response in messages + memory
                     self.messages.append({"role": "assistant", "content": json.dumps(decision)})
@@ -410,12 +640,13 @@ class AIDOSKernel:
         os.system("clear")
         provider_name = type(self.llm).__name__
         model_name = getattr(self.llm, "model", "unknown")
+        dry_status = "🔒 DRY-RUN" if self.dry_run else "🔓 LIVE"
         boot = Panel(
             "[bold cyan]AI-DOS Kernel v0.1[/bold cyan]\n"
             "[dim]Experimental AI Operating System[/dim]\n"
             f"[dim]Backend: {provider_name} ({model_name})[/dim]\n"
             "[dim]This is a Lenninator experience[/dim]\n"
-            f"[dim]Plugins: {len(TOOLS)} tool(s) loaded[/dim]\n\n"
+            f"[dim]Plugins: {len(TOOLS)} tool(s) loaded | {dry_status}[/dim]\n\n"
             "[green]Type 'help' for commands. 'exit' to shutdown.[/green]",
             title="🚀 SYSTEM BOOT",
             border_style="cyan",
@@ -426,10 +657,13 @@ class AIDOSKernel:
 
     def _show_shutdown(self):
         """Display shutdown message."""
+        self.scheduler.stop()
         save_session(self.messages)
+        tasks_count = len(self.scheduler.list_tasks())
         console.print(Panel(
             "[bold]Shutting down kernel...[/bold]\n"
             f"[dim]Session commands logged: {len(self.session_log)}[/dim]\n"
+            f"[dim]Background tasks tracked: {tasks_count}[/dim]\n"
             f"[dim]Session saved: {len(self.messages)} messages[/dim]",
             title="⏻ POWER OFF",
             border_style="red",
@@ -443,7 +677,18 @@ class AIDOSKernel:
         help_text.add_row("exit / quit / shutdown", "Shut down AI-DOS")
         help_text.add_row("clear", "Clear the terminal")
         help_text.add_row("help", "Show this help")
+        help_text.add_row("bg <command>", "Run a command in background (non-blocking)")
+        help_text.add_row("jobs / tasks", "List all background tasks")
+        help_text.add_row("cancel <id>", "Cancel a running background task")
         help_text.add_row("model <name>", "Switch LLM model (e.g., model llama3.2:3b)")
+        help_text.add_row("dry-run", "Toggle dry-run mode (simulate, don't execute)")
+        help_text.add_row("vfs", "List virtual filesystem root")
+        help_text.add_row("cat <path>", "Read a virtual file (e.g., cat /memory)")
+        help_text.add_row("remember <text>", "Store a fact in long-term memory")
+        help_text.add_row("recall <query>", "Search long-term memory by keywords")
+        help_text.add_row("facts", "List all stored facts")
+        help_text.add_row("agents", "List available AI agents")
+        help_text.add_row("agent <name> <task>", "Delegate a task to a specific agent")
         help_text.add_row("anything else", "Natural language command for the AI kernel")
         console.print(Panel(help_text, title="📖 AI-DOS HELP"))
 
@@ -462,7 +707,7 @@ class AIDOSKernel:
             return None
 
 
-def run_ai_dos(model: str = "llama3.2:1b"):
+def run_ai_dos(model: str = "llama3.2:1b", dry_run: bool = False):
     """Entry point to start the AI-DOS kernel."""
-    kernel = AIDOSKernel(model=model)
+    kernel = AIDOSKernel(model=model, dry_run=dry_run)
     kernel.run_interactive()

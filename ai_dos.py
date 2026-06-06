@@ -6,6 +6,7 @@ Entry point. Boots the kernel.
 Usage:
     python ai_dos.py                          # Auto-detect: Groq or Ollama
     python ai_dos.py --model llama3.2:3b      # Specific Ollama model
+    python ai_dos.py --dry-run                # Simulation mode (no real execution)
     GROQ_API_KEY=gsk_... python ai_dos.py     # Force Groq
 """
 
@@ -20,6 +21,7 @@ from kernel.engine import run_ai_dos
 
 def main():
     model = "llama3.2:1b"
+    dry_run = "--dry-run" in sys.argv
 
     # Parse --model flag
     if "--model" in sys.argv:
@@ -27,9 +29,11 @@ def main():
         if idx + 1 < len(sys.argv):
             model = sys.argv[idx + 1]
 
-    # Future: hardware detection, memory store initialization,
-    # filesystem indexing, driver loading goes here.
-    run_ai_dos(model=model)
+    # Parse --dry-run flag
+    if "--dry-run" in sys.argv:
+        sys.argv.remove("--dry-run")
+
+    run_ai_dos(model=model, dry_run=dry_run)
 
 
 if __name__ == "__main__":
