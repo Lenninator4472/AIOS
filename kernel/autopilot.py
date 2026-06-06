@@ -156,9 +156,9 @@ class AutoPilot(Service):
                 self._action_log.pop(0)
 
     def get_action_log(self, limit: int = 10) -> list[dict]:
-        """Return the most recent *limit* action log entries."""
+        """Return the most recent *limit* action log entries (newest first)."""
         with self._lock:
-            return list(self._action_log[-limit:])
+            return list(reversed(self._action_log[-limit:]))
 
     def get_stats(self) -> dict:
         """Return a dict mapping event types to occurrence counts."""

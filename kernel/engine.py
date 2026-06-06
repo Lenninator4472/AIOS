@@ -25,6 +25,14 @@ from kernel.scheduler import BackgroundTaskScheduler, TaskStatus
 from kernel.vfs import VirtualFileSystem
 from kernel.agent import Agent, AgentOrchestrator, CODER_PROMPT, RESEARCHER_PROMPT, SYSADMIN_PROMPT, PLANNER_PROMPT
 from kernel.checkpoint import save_checkpoint, load_checkpoint
+from kernel.monitor import SystemMonitor
+from kernel.autopilot import AutoPilot
+from kernel.tool_context import ToolContext
+from kernel.logger import LoggingService
+from kernel.watcher import FileWatcher
+from kernel.cron import CronService
+from kernel.api import RestAPI
+from kernel.session import SessionManager
 
 # Rich UI components
 from rich.console import Console
@@ -198,11 +206,13 @@ class AIDOSKernel:
         self.memory.initialize_default_account()
         self.max_correction_retries = 3
         self.session_log: list[dict] = []
+        self.tool_context = ToolContext(timeout=30.0, result_limit=10000)
 
         load_plugins()
         tool_defs = build_tool_definitions()
         self.system_prompt = SYSTEM_PROMPT + tool_defs
-        self.messages = [{"role": "system", "content": self.system_prompt}]
+        self.sessions = SessionManager()
+        self.sessions.current_messages = [{"role": "system", "content": self.system_prompt}]
         set_dry_run(dry_run)
         self.dry_run = dry_run
         self.facts = FactMemory()
@@ -233,11 +243,25 @@ class AIDOSKernel:
         self.orchestrator.register(Agent("planner", PLANNER_PROMPT))
         self.vfs.mount("/system/agents", reader=lambda: ", ".join(self.orchestrator.list_agents()))
 
+        # Service infrastructure: system monitor, autopilot, logger, watcher, cron, API
+        self.services: dict[str, Service] = {}
+        self._init_service_infrastructure()
+
         load_checkpoint(self)
         saved = load_session()
         if saved:
             console.print(f"  [dim][restored {len(saved)} messages from last session][/dim]")
-            self.messages.extend(saved)
+            for msg in saved:
+                self.sessions.add_message(msg)
+
+    @property
+    def messages(self) -> list:
+        """Delegate to the current session's message list."""
+        return self.sessions.current_messages
+
+    @messages.setter
+    def messages(self, value: list):
+        self.sessions.current_messages = value
 
     def _format_vfs_memory(self) -> str:
         facts = self.facts.list_all(limit=5)
@@ -259,8 +283,113 @@ class AIDOSKernel:
             lines.append(f"[{t.status.value}] {t.task_id[:8]} {t.command[:50]}")
         return "\n".join(lines)
 
+    def _init_service_infrastructure(self):
+        """Initialize and start all optional kernel services."""
+        # SystemMonitor — /proc-based CPU/memory polling daemon
+        self.monitor = SystemMonitor(self.bus, interval=5.0)
+        self.monitor.start()
+        self.services["monitor"] = self.monitor
+        self.vfs.mount("/system/monitor/snapshot", reader=lambda: json.dumps(self.monitor.get_snapshot(), indent=2))
+        self.vfs.mount("/system/monitor/health", reader=lambda: self.monitor.get_snapshot().get("health", "unknown"))
+
+        # AutoPilot — automatic failure analysis via LLM
+        self.autopilot = AutoPilot("autopilot", self.bus)
+        self.autopilot.start()
+        self.services["autopilot"] = self.autopilot
+
+        # LoggingService — captures all bus events to JSONL files
+        self.logger = LoggingService(self.bus)
+        self.logger.start()
+        self.services["logger"] = self.logger
+        self.vfs.mount("/system/logs/path", reader=lambda: self.logger.get_log_path())
+
+        # FileWatcher — polls ~/Downloads and ~/ai-dos for changes
+        self.watcher = FileWatcher(self.bus, interval=2.0)
+        self.watcher.start()
+        self.services["watcher"] = self.watcher
+        self.vfs.mount("/watcher/dirs", reader=lambda: json.dumps(self.watcher.get_watched_dirs(), indent=2))
+
+        # CronService — cron-like task scheduler with SQLite persistence
+        self.cron = CronService(self.bus)
+        self.cron.start()
+        self.services["cron"] = self.cron
+        self.vfs.mount("/cron/jobs", reader=lambda: json.dumps(self.cron.list_jobs(), indent=2, default=str))
+
+        # RestAPI — lightweight HTTP API on port 8765
+        self.api = RestAPI(self.bus, vfs=self.vfs, scheduler=self.scheduler,
+                           orchestrator=self.orchestrator, facts=self.facts)
+        self.api.start()
+        self.services["api"] = self.api
+
+        # Virtual file for service health summary
+        self.vfs.mount("/system/services", reader=lambda: self._format_vfs_services())
+
+        # Virtual file for session info
+        self.vfs.mount("/system/sessions", reader=lambda: ", ".join(self.sessions.names()))
+
+    def _handle_session_cmd(self, args: str):
+        parts = args.split()
+        if not parts:
+            return
+        cmd = parts[0]
+
+        if cmd == "create" and len(parts) >= 2:
+            name = parts[1]
+            if self.sessions.create(name):
+                console.print(f"[green]Session '{name}' created.[/green]")
+            else:
+                console.print(f"[yellow]Session '{name}' already exists.[/yellow]")
+
+        elif cmd == "switch" and len(parts) >= 2:
+            name = parts[1]
+            if self.sessions.switch(name):
+                sys_prompt = self.sessions.current_messages[0] if self.sessions.current_messages else None
+                if sys_prompt is None or sys_prompt.get("role") != "system":
+                    self.sessions.current_messages.insert(0, {"role": "system", "content": self.system_prompt})
+                info = self.sessions.info(name)
+                console.print(f"[green]Switched to '{name}' ({info['message_count']} messages).[/green]")
+            else:
+                console.print(f"[yellow]Session '{name}' not found.[/yellow]")
+
+        elif cmd == "delete" and len(parts) >= 2:
+            name = parts[1]
+            if self.sessions.delete(name):
+                console.print(f"[green]Session '{name}' deleted.[/green]")
+            else:
+                console.print(f"[yellow]Cannot delete '{name}' (doesn't exist or is default).[/yellow]")
+
+        elif cmd == "rename" and len(parts) >= 3:
+            old, new = parts[1], parts[2]
+            if self.sessions.rename(old, new):
+                console.print(f"[green]Session '{old}' renamed to '{new}'.[/green]")
+            else:
+                console.print(f"[yellow]Cannot rename '{old}' to '{new}'.[/yellow]")
+
+        elif cmd == "info" or cmd == "show":
+            name = parts[1] if len(parts) >= 2 else None
+            info = self.sessions.info(name)
+            console.print(Panel(
+                f"Name: {info['name']}\n"
+                f"Messages: {info['message_count']}\n"
+                f"Created: {info['created_at']}\n"
+                f"Updated: {info['updated_at']}",
+                title="📁 SESSION INFO",
+                border_style="cyan",
+            ))
+
+        else:
+            console.print("[yellow]Usage: session <create|switch|delete|rename|info> [args...][/yellow]")
+
+    def _format_vfs_services(self) -> str:
+        lines = ["Service              Status    Name"]
+        lines.append("-" * 45)
+        for srv_name, srv in sorted(self.services.items()):
+            hc = srv.health_check()
+            running = "RUNNING" if srv.is_running else "STOPPED"
+            lines.append(f"{srv_name:<20} {running:<10} {hc.get('name', '')}")
+        return "\n".join(lines)
+
     def _on_task_event(self, event_type: str, data: dict):
-        """Callback for task lifecycle events from the scheduler."""
         self._task_log.append({"event": event_type, "data": data})
         if event_type == "task.completed":
             tid = data.get("task_id", "?")[:8]
@@ -326,11 +455,11 @@ class AIDOSKernel:
         tool_call = parse_tool_call(raw_response)
         if tool_call and tool_call["name"] in TOOLS:
             func = TOOLS[tool_call["name"]]
-            try:
-                result = func(**tool_call["arguments"])
-                console.print(f"  [dim]🔧 tool {tool_call['name']} → {result[:200]}[/dim]")
-            except Exception as e:
-                console.print(f"  [dim][red]🔧 tool {tool_call['name']} error: {e}[/red][/dim]")
+            tc_result = self.tool_context.execute(func, **tool_call["arguments"])
+            if tc_result["ok"]:
+                console.print(f"  [dim]🔧 tool {tool_call['name']} → {tc_result['result'][:200]}[/dim]")
+            else:
+                console.print(f"  [dim][red]🔧 tool {tool_call['name']} error: {tc_result['error']}[/red][/dim]")
 
         decision = extract_json(raw_response)
 
@@ -350,11 +479,11 @@ class AIDOSKernel:
             args = tc.get("arguments", {})
             if name in TOOLS:
                 func = TOOLS[name]
-                try:
-                    result = func(**args)
-                    console.print(f"  [dim]🔧 {name} → {str(result)[:200]}[/dim]")
-                except Exception as e:
-                    console.print(f"  [dim][red]🔧 {name} error: {e}[/red][/dim]")
+                tc_result = self.tool_context.execute(func, **args)
+                if tc_result["ok"]:
+                    console.print(f"  [dim]🔧 {name} → {tc_result['result'][:200]}[/dim]")
+                else:
+                    console.print(f"  [dim][red]🔧 {name} error: {tc_result['error']}[/red][/dim]")
 
         return decision
 
@@ -560,6 +689,21 @@ class AIDOSKernel:
                         else:
                             console.print("[dim]No facts stored yet.[/dim]")
                         continue
+                    if user_input.lower() in ("services", "status"):
+                        srv_text = self._format_vfs_services()
+                        console.print(Panel(srv_text, title="🔧 SERVICES", border_style="cyan"))
+                        continue
+                    if user_input.lower().startswith("session "):
+                        self._handle_session_cmd(user_input[8:].strip())
+                        continue
+                    if user_input.lower() in ("sessions",):
+                        names = self.sessions.names()
+                        console.print("[bold]Sessions:[/bold]")
+                        for n in names:
+                            marker = " ←" if n == self.sessions.current else ""
+                            info = self.sessions.info(n)
+                            console.print(f"  📁 {n}{marker} [dim]({info['message_count']} msgs)[/dim]")
+                        continue
 
                     # --- PROCESS INTENT (streaming) ---
                     decision = self.process_intent_streaming(user_input)
@@ -634,7 +778,7 @@ class AIDOSKernel:
                     continue
 
         finally:
-            save_session(self.messages)
+            self.sessions.save_all()
 
     def _show_boot_screen(self):
         """Display the AI-DOS boot screen."""
@@ -657,15 +801,20 @@ class AIDOSKernel:
         console.print()
 
     def _show_shutdown(self):
-        """Display shutdown message."""
         save_checkpoint(self)
+        for srv_name in list(self.services.keys()):
+            try:
+                self.services[srv_name].stop()
+            except Exception:
+                pass
         self.scheduler.stop()
-        save_session(self.messages)
+        self.sessions.save_all()
         tasks_count = len(self.scheduler.list_tasks())
         console.print(Panel(
             "[bold]Shutting down kernel...[/bold]\n"
             f"[dim]Session commands logged: {len(self.session_log)}[/dim]\n"
             f"[dim]Background tasks tracked: {tasks_count}[/dim]\n"
+            f"[dim]Services stopped: {len(self.services)}[/dim]\n"
             f"[dim]Session saved: {len(self.messages)} messages[/dim]",
             title="⏻ POWER OFF",
             border_style="red",
@@ -689,6 +838,13 @@ class AIDOSKernel:
         help_text.add_row("remember <text>", "Store a fact in long-term memory")
         help_text.add_row("recall <query>", "Search long-term memory by keywords")
         help_text.add_row("facts", "List all stored facts")
+        help_text.add_row("services / status", "Show all running kernel services and health")
+        help_text.add_row("sessions", "List all named sessions")
+        help_text.add_row("session create <name>", "Create a new session")
+        help_text.add_row("session switch <name>", "Switch to a different session")
+        help_text.add_row("session delete <name>", "Delete a session")
+        help_text.add_row("session rename <old> <new>", "Rename a session")
+        help_text.add_row("session info [name]", "Show session details")
         help_text.add_row("agents", "List available AI agents")
         help_text.add_row("agent <name> <task>", "Delegate a task to a specific agent")
         help_text.add_row("anything else", "Natural language command for the AI kernel")
