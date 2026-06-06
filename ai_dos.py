@@ -4,7 +4,9 @@ AI-DOS: AI Disk Operating System
 Entry point. Boots the kernel.
 
 Usage:
-    python ai_dos.py                  # Default model (llama3.2:1b)
+    python ai_dos.py                          # Auto-detect: Groq or Ollama
+    python ai_dos.py --model llama3.2:3b      # Specific Ollama model
+    GROQ_API_KEY=gsk_... python ai_dos.py     # Force Groq
 """
 
 import sys

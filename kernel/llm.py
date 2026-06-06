@@ -1,9 +1,10 @@
 """
 AI-DOS Kernel: LLM Backend Abstraction
-Talks to Ollama (local), with pattern for OpenAI/Anthropic backends.
+Talks to Ollama (local) or Groq (cloud), with pattern for more backends.
 """
 
 import json
+import os
 import re
 import sys
 import requests
@@ -129,6 +130,146 @@ class OllamaBackend(LLMBackend):
             })
             yield err
             return err
+
+
+class GroqBackend(LLMBackend):
+    """Cloud Groq backend. Requires GROQ_API_KEY env var."""
+
+    def __init__(self, model: str = "llama-3.3-70b-versatile"):
+        self.model = model
+        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.api_key = os.environ.get("GROQ_API_KEY", "")
+
+    def _build_messages(self, system_prompt: str, user_input: str, history: list[dict]) -> list[dict]:
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in history:
+            messages.append(msg)
+        messages.append({"role": "user", "content": user_input})
+        return messages
+
+    def query(self, system_prompt: str, user_input: str, history: list[dict]) -> str:
+        if not self.api_key:
+            return json.dumps({
+                "thought_process": "Kernel error: GROQ_API_KEY not set",
+                "required_tools": [],
+                "commands": [],
+                "user_response": "☠ KERNEL ERROR: GROQ_API_KEY environment variable not set.",
+            })
+        messages = self._build_messages(system_prompt, user_input, history)
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 1024,
+        }
+        try:
+            resp = requests.post(
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except requests.exceptions.HTTPError as e:
+            return json.dumps({
+                "thought_process": f"Groq API error: {e}",
+                "required_tools": [],
+                "commands": [],
+                "user_response": f"☠ GROQ ERROR: {e}",
+            })
+        except requests.exceptions.ConnectionError:
+            return json.dumps({
+                "thought_process": "Kernel error: cannot reach Groq API",
+                "required_tools": [],
+                "commands": [],
+                "user_response": "☠ KERNEL PANIC: Cannot reach Groq API. Check internet connection.",
+            })
+        except Exception as e:
+            return json.dumps({
+                "thought_process": f"Kernel error: {str(e)}",
+                "required_tools": [],
+                "commands": [],
+                "user_response": f"☠ KERNEL ERROR: {str(e)}",
+            })
+
+    def query_stream(self, system_prompt: str, user_input: str, history: list[dict]) -> Generator[str, None, str]:
+        if not self.api_key:
+            err = json.dumps({
+                "thought_process": "Kernel error: GROQ_API_KEY not set",
+                "required_tools": [],
+                "commands": [],
+                "user_response": "☠ KERNEL ERROR: GROQ_API_KEY not set.",
+            })
+            yield err
+            return err
+        messages = self._build_messages(system_prompt, user_input, history)
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 1024,
+            "stream": True,
+        }
+        full_response = ""
+        try:
+            resp = requests.post(
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                stream=True,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                decoded = line.decode("utf-8")
+                if decoded.startswith("data: "):
+                    chunk_data = decoded[6:]
+                    if chunk_data.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(chunk_data)
+                        content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if content:
+                            full_response += content
+                            yield content
+                    except json.JSONDecodeError:
+                        continue
+            return full_response
+        except requests.exceptions.ConnectionError:
+            err = json.dumps({
+                "thought_process": "Kernel error: cannot reach Groq API",
+                "required_tools": [],
+                "commands": [],
+                "user_response": "☠ KERNEL PANIC: Cannot reach Groq API.",
+            })
+            yield err
+            return err
+        except Exception as e:
+            err = json.dumps({
+                "thought_process": f"Kernel error: {str(e)}",
+                "required_tools": [],
+                "commands": [],
+                "user_response": f"☠ KERNEL ERROR: {str(e)}",
+            })
+            yield err
+            return err
+
+
+def get_provider(model: str = "llama3.2:1b") -> LLMBackend:
+    """Auto-detect: Groq if GROQ_API_KEY is set, else Ollama."""
+    if os.environ.get("GROQ_API_KEY"):
+        return GroqBackend()
+    return OllamaBackend(model=model)
 
 
 def extract_json(text: str) -> Optional[dict]:

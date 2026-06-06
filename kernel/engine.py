@@ -4,16 +4,18 @@ Boots the terminal, processes intents through the LLM,
 executes commands safely, and handles self-correction.
 """
 
+import importlib.util
+import inspect
+import json
 import os
 import sys
-import json
-import shlex
+from datetime import datetime
 from typing import Optional
 
 # Add parent to path so ai_dos.py can import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from kernel.llm import OllamaBackend, extract_json
+from kernel.llm import get_provider, extract_json
 from kernel.executor import execute, needs_confirmation
 from kernel.memory import ConversationMemory
 
@@ -27,6 +29,21 @@ from rich.text import Text
 from rich import box
 
 console = Console()
+
+HOME = os.path.expanduser("~")
+BASE_DIR = os.path.join(HOME, ".ai-dos")
+TOOLS_DIR = os.path.join(BASE_DIR, "tools")
+SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+SESSION_FILE = os.path.join(SESSIONS_DIR, "last_session.json")
+MAX_CONTEXT_CHARS = 60000
+MAX_TOOL_DEPTH = 10
+
+# Built-in tool definitions the LLM can invoke directly
+TOOLS = {}
+
+TOOL_DOC = """
+PLUGIN TOOLS (use instead of commands for these operations):
+"""
 
 SYSTEM_PROMPT = """You are the Core Intelligence Kernel of an experimental operating system named AI-DOS. You sit directly between the user's natural language desires and a low-level Linux backbone. Your job is to translate human intent into flawless, safe, and efficient system-level actions.
 
@@ -50,15 +67,116 @@ CRITICAL RULES:
 - Output ONLY valid JSON. No other text. I repeat: ONLY valid JSON."""
 
 
+def load_plugins():
+    """Scan ~/.ai-dos/tools/*.py and register tool_* functions into TOOLS dict."""
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    count = 0
+    for fname in sorted(os.listdir(TOOLS_DIR)):
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(TOOLS_DIR, fname)
+        mod_name = fname[:-3]
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, fpath)
+            if spec is None or spec.loader is None:
+                console.print(f"  [dim][plugin] skipped {fname}: bad spec[/dim]")
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            found = 0
+            for name, func in inspect.getmembers(mod, inspect.isfunction):
+                if name.startswith("tool_"):
+                    TOOLS[name[5:]] = func
+                    found += 1
+            if found > 0:
+                console.print(f"  [dim][plugin] loaded {fname} ({found} tool(s))[/dim]")
+                count += found
+            else:
+                console.print(f"  [dim][plugin] loaded {fname} (no tool_ functions)[/dim]")
+        except Exception as e:
+            console.print(f"  [yellow][plugin] error loading {fname}: {e}[/yellow]")
+    if count > 0:
+        console.print(f"  [dim][plugins] {count} plugin tool(s) available[/dim]")
+    return count
+
+
+def prune_context(messages):
+    """Drop oldest user/assistant pairs if total JSON size exceeds limit."""
+    total = sum(len(json.dumps(m)) for m in messages)
+    if total <= MAX_CONTEXT_CHARS:
+        return
+    keep = [messages[0]]
+    rest = list(messages[1:])
+    pruned = 0
+    while len(rest) >= 2 and total > MAX_CONTEXT_CHARS:
+        rest.pop(0)
+        rest.pop(0)
+        pruned += 2
+        total = sum(len(json.dumps(m)) for m in keep + rest)
+    messages.clear()
+    messages.extend(keep + rest)
+    console.print(f"  [yellow][pruned {pruned} messages, {len(messages)} remaining][/yellow]")
+
+
+def save_session(messages):
+    """Save non-system messages to last_session.json."""
+    if len(messages) <= 1:
+        return
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    save = messages[1:]
+    with open(SESSION_FILE, "w") as f:
+        json.dump(save, f)
+
+
+def load_session():
+    """Load previously saved messages from last_session.json."""
+    if not os.path.isfile(SESSION_FILE):
+        return None
+    try:
+        with open(SESSION_FILE) as f:
+            msgs = json.load(f)
+        if isinstance(msgs, list) and len(msgs) > 0:
+            return msgs
+    except Exception:
+        pass
+    return None
+
+
+def parse_tool_call(text):
+    """Parse a TOOL:name {...} line from LLM response."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("TOOL:"):
+            rest = s[5:].strip()
+            try:
+                idx = rest.index(" ")
+                name = rest[:idx]
+                raw = rest[idx:].strip()
+                raw = raw.removeprefix("```json").removeprefix("```")
+                raw = raw.removesuffix("```").strip()
+                args = json.loads(raw)
+                return {"name": name, "arguments": args}
+            except (ValueError, json.JSONDecodeError):
+                pass
+    return None
+
+
 class AIDOSKernel:
     """The AI-DOS kernel orchestrator."""
 
     def __init__(self, model: str = "llama3.2:1b"):
-        self.llm = OllamaBackend(model=model)
+        self.llm = get_provider(model=model)
         self.memory = ConversationMemory(max_exchanges=10)
-        self.memory.initialize_default_account()  # <-- ADD THIS LINE
+        self.memory.initialize_default_account()
         self.max_correction_retries = 3
         self.session_log: list[dict] = []
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Restore previous session
+        saved = load_session()
+        if saved:
+            console.print(f"  [dim][restored {len(saved)} messages from last session][/dim]")
+            self.messages.extend(saved)
 
     def process_intent(self, user_input: str) -> dict:
         """Process a user command through the LLM and return structured decision."""
@@ -71,6 +189,13 @@ class AIDOSKernel:
 
         # Build prompt with conversation context
         full_prompt = self._build_prompt(user_input)
+
+        # Track conversation for context pruning
+        self.messages.append({"role": "user", "content": user_input})
+        self.memory.add("user", user_input)
+
+        # Prune context before LLM call
+        prune_context(self.messages)
 
         # Query the LLM using the newly updated prompt template
         raw_response = self.llm.query(active_system_prompt, full_prompt, self.memory.get_context())
@@ -178,115 +303,119 @@ class AIDOSKernel:
             console.print(f"[red]{test_decision['user_response']}[/red]")
             console.print("[yellow]Starting in offline mode (commands only, no LLM).[/yellow]")
 
-        while True:
-            try:
-                user_input = self._get_input()
-                if user_input is None:
+        try:
+            while True:
+                try:
+                    user_input = self._get_input()
+                    if user_input is None:
+                        continue
+                    if user_input == "":
+                        continue
+
+                    # Handle built-in commands
+                    if user_input.lower() in ("exit", "quit", "shutdown", "poweroff"):
+                        self._show_shutdown()
+                        break
+                    if user_input.lower() == "clear":
+                        os.system("clear")
+                        continue
+                    if user_input.lower() == "help":
+                        self._show_help()
+                        continue
+                    if user_input.lower().startswith("model "):
+                        new_model = user_input[6:].strip()
+                        if new_model:
+                            self.llm.model = new_model
+                            console.print(f"[green]Switched to model: {new_model}[/green]")
+                        continue
+
+                    # --- PROCESS INTENT ---
+                    with console.status("[bold cyan]🧠 Processing intent...[/bold cyan]"):
+                        decision = self.process_intent(user_input)
+
+                    # Store response in messages + memory
+                    self.messages.append({"role": "assistant", "content": json.dumps(decision)})
+                    self.memory.add("assistant", json.dumps(decision))
+
+                    # --- DISPLAY THOUGHT PROCESS ---
+                    if decision.get("thought_process"):
+                        console.print(Panel(
+                            f"[italic]{decision['thought_process']}[/italic]",
+                            title="🧠 KERNEL THOUGHT",
+                            border_style="dim",
+                            box=box.ROUNDED,
+                        ))
+
+                    # --- DISPLAY TOOLS ---
+                    tools = decision.get("required_tools", [])
+                    if tools:
+                        tool_str = ", ".join(f"[blue]{t}[/blue]" for t in tools)
+                        console.print(f"  [dim]Tools: {tool_str}[/dim]")
+
+                    # --- EXECUTE COMMANDS ---
+                    commands = decision.get("commands", [])
+                    if commands:
+                        console.print()
+                        console.print(Panel(
+                            "\n".join(f"  [bold yellow]$ {c}[/bold yellow]" for c in commands),
+                            title="⚡ EXECUTING SYSCALLS",
+                            border_style="yellow",
+                            box=box.ROUNDED,
+                        ))
+
+                        results = self.execute_with_correction(commands, decision.get("thought_process", ""))
+
+                        # Show command outputs
+                        for cmd, result in zip(commands, results):
+                            if result["stdout"]:
+                                console.print(Syntax(
+                                    result["stdout"].rstrip(),
+                                    "bash",
+                                    theme="monokai",
+                                    word_wrap=True,
+                                ))
+                            if result["stderr"]:
+                                console.print(f"[red]{result['stderr']}[/red]")
+                            if result["exit_code"] == 0 and not result["stdout"] and not result["stderr"]:
+                                console.print("[dim]✔ Command completed silently.[/dim]")
+                            elif result["exit_code"] == -2:
+                                console.print(f"[yellow]⏭ {result['stderr']}[/yellow]")
+
+                    # --- USER RESPONSE ---
+                    response_text = decision.get("user_response", "")
+                    if response_text:
+                        console.print()
+                        console.print(Panel(
+                            Markdown(response_text) if len(response_text) > 50 else response_text,
+                            title="🤖 AI-DOS",
+                            border_style="green",
+                            box=box.ROUNDED,
+                        ))
+
+                    # Log session
+                    self.session_log.append({
+                        "input": user_input,
+                        "decision": decision,
+                    })
+
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]Interrupted. Press Ctrl+D or type 'exit' to shutdown.[/yellow]")
                     continue
-                if user_input == "":
-                    continue
 
-                # Handle built-in commands
-                if user_input.lower() in ("exit", "quit", "shutdown", "poweroff"):
-                    self._show_shutdown()
-                    break
-                if user_input.lower() == "clear":
-                    os.system("clear")
-                    continue
-                if user_input.lower() == "help":
-                    self._show_help()
-                    continue
-                if user_input.lower().startswith("model "):
-                    new_model = user_input[6:].strip()
-                    if new_model:
-                        self.llm.model = new_model
-                        console.print(f"[green]Switched to model: {new_model}[/green]")
-                    continue
-
-                # Record in memory
-                self.memory.add("user", user_input)
-
-                # --- PROCESS INTENT ---
-                with console.status("[bold cyan]🧠 Processing intent...[/bold cyan]"):
-                    decision = self.process_intent(user_input)
-
-                # Store response in memory
-                self.memory.add("assistant", json.dumps(decision))
-
-                # --- DISPLAY THOUGHT PROCESS ---
-                if decision.get("thought_process"):
-                    console.print(Panel(
-                        f"[italic]{decision['thought_process']}[/italic]",
-                        title="🧠 KERNEL THOUGHT",
-                        border_style="dim",
-                        box=box.ROUNDED,
-                    ))
-
-                # --- DISPLAY TOOLS ---
-                tools = decision.get("required_tools", [])
-                if tools:
-                    tool_str = ", ".join(f"[blue]{t}[/blue]" for t in tools)
-                    console.print(f"  [dim]Tools: {tool_str}[/dim]")
-
-                # --- EXECUTE COMMANDS ---
-                commands = decision.get("commands", [])
-                if commands:
-                    console.print()
-                    console.print(Panel(
-                        "\n".join(f"  [bold yellow]$ {c}[/bold yellow]" for c in commands),
-                        title="⚡ EXECUTING SYSCALLS",
-                        border_style="yellow",
-                        box=box.ROUNDED,
-                    ))
-
-                    results = self.execute_with_correction(commands, decision.get("thought_process", ""))
-
-                    # Show command outputs
-                    for cmd, result in zip(commands, results):
-                        if result["stdout"]:
-                            console.print(Syntax(
-                                result["stdout"].rstrip(),
-                                "bash",
-                                theme="monokai",
-                                word_wrap=True,
-                            ))
-                        if result["stderr"]:
-                            console.print(f"[red]{result['stderr']}[/red]")
-                        if result["exit_code"] == 0 and not result["stdout"] and not result["stderr"]:
-                            console.print("[dim]✔ Command completed silently.[/dim]")
-                        elif result["exit_code"] == -2:
-                            console.print(f"[yellow]⏭ {result['stderr']}[/yellow]")
-
-                # --- USER RESPONSE ---
-                response_text = decision.get("user_response", "")
-                if response_text:
-                    console.print()
-                    console.print(Panel(
-                        Markdown(response_text) if len(response_text) > 50 else response_text,
-                        title="🤖 AI-DOS",
-                        border_style="green",
-                        box=box.ROUNDED,
-                    ))
-
-                # Log session
-                self.session_log.append({
-                    "input": user_input,
-                    "decision": decision,
-                })
-
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Interrupted. Press Ctrl+D or type 'exit' to shutdown.[/yellow]")
-                continue
+        finally:
+            save_session(self.messages)
 
     def _show_boot_screen(self):
         """Display the AI-DOS boot screen."""
         os.system("clear")
+        provider_name = type(self.llm).__name__
+        model_name = getattr(self.llm, "model", "unknown")
         boot = Panel(
             "[bold cyan]AI-DOS Kernel v0.1[/bold cyan]\n"
             "[dim]Experimental AI Operating System[/dim]\n"
-            "[dim]LLM Core: llama3.2:1b (local)[/dim]\n"
-	    "[dim]This is a Lenninator experience[/dim]\n"
-            "[dim]Kernel: Python 3.11 + Ollama[/dim]\n\n"
+            f"[dim]Backend: {provider_name} ({model_name})[/dim]\n"
+            "[dim]This is a Lenninator experience[/dim]\n"
+            f"[dim]Plugins: {len(TOOLS)} tool(s) loaded[/dim]\n\n"
             "[green]Type 'help' for commands. 'exit' to shutdown.[/green]",
             title="🚀 SYSTEM BOOT",
             border_style="cyan",
@@ -297,9 +426,11 @@ class AIDOSKernel:
 
     def _show_shutdown(self):
         """Display shutdown message."""
+        save_session(self.messages)
         console.print(Panel(
             "[bold]Shutting down kernel...[/bold]\n"
-            f"[dim]Session commands logged: {len(self.session_log)}[/dim]",
+            f"[dim]Session commands logged: {len(self.session_log)}[/dim]\n"
+            f"[dim]Session saved: {len(self.messages)} messages[/dim]",
             title="⏻ POWER OFF",
             border_style="red",
         ))
