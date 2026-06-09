@@ -49,6 +49,8 @@ class EventBus:
 
     def __init__(self):
         self._subscribers: dict[str, list[EventHandler]] = {}
+        self._subscribers["terminal.input"] = []
+        self._subscribers["terminal.output"] = []
 
     def subscribe(self, event_type: str, handler: EventHandler):
         """Register *handler* for *event_type*.  ``*`` matches one segment."""

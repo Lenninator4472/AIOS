@@ -425,6 +425,36 @@ class AIDOSKernel:
 
         return decision
 
+    def _dispatch(self, text: str) -> str:
+        """Route a terminal command through the AI pipeline.
+
+        Processes the input through the LLM, executes any commands,
+        and returns the user-facing response string.
+        """
+        decision = self.process_intent(text)
+
+        self.messages.append({"role": "assistant", "content": json.dumps(decision)})
+        self.memory.add("assistant", json.dumps(decision))
+
+        commands = decision.get("commands", [])
+        if commands:
+            results = self.execute_with_correction(commands, decision.get("thought_process", ""))
+            output_lines = []
+            for cmd, result in zip(commands, results):
+                if result["stdout"]:
+                    output_lines.append(result["stdout"].rstrip())
+                if result["stderr"]:
+                    output_lines.append(f"Error: {result['stderr'].rstrip()}")
+                if result["exit_code"] != 0 and not result["stderr"]:
+                    output_lines.append(f"Exit code: {result['exit_code']}")
+            if output_lines:
+                existing = decision.get("user_response", "")
+                decision["user_response"] = (existing + "\n\n" + "\n".join(output_lines)) if existing else "\n".join(output_lines)
+
+        self.session_log.append({"input": text, "decision": decision})
+
+        return decision.get("user_response", "Done.")
+
     def process_intent_streaming(self, user_input: str) -> dict:
         """Process intent with live token streaming to console.
 
